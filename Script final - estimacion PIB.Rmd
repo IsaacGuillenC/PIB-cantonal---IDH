@@ -1,0 +1,479 @@
+---
+title: "Estimación PIB cantonal 2015-2019; 2021"
+output:
+  html_document:
+    highlight: tango
+    theme: cerulean
+  word_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+#Datos necesarios las predicciones (por año)
+
+```{r}
+load("datos_prediccion_pobypatentes.Rdata") #contiene todos los años juntos
+load("datos_2015.Rdata")
+load("datos_2016.Rdata")
+load("datos_2017.Rdata")
+load("datos_2018.Rdata")
+load("datos_2019.Rdata")
+load("datos_2021.Rdata")
+```
+
+### Preparación inicial de los datos del año 2020 (año base para las estimaciones)
+
+Se inicia cargando las librerías necesarias. 
+
+```{r include=FALSE}
+options(scipen=999)
+library(readxl)
+library(xlsx)
+library(dplyr)
+library(writexl)
+library(ggplot2)
+library(car)
+library(fitdistrplus)
+library(logspline)
+library(fitur)
+library(actuar)
+library(lmtest)
+library(goeveg)
+library('GGally')
+library(psych)
+library(Rfast)
+library(Rfast2)
+library(performance)
+library(mgcv)
+library(gratia)
+```
+
+
+Ahora se cargan los datos del PIB cantonal del año 2020, estos se tomarán como base para la estimación de los modelos de regresión. También se cargan los datos de las patentes municipales para cada cantón para ese mismo año. Se excluye por ahora el valor de Río Cuarto, pues este no está disponible.
+
+**El número de patentes de Rio Cuarto no está disponible (aparece con NA). El cantón se crea en el año 2017, para los años 2015 y 2016 colocar que el IDH Río Cuarto sea el mismo que el de Grecia, tal como hace el PNUD. ¿Cómo manejo los siguientes años?**
+
+```{r}
+datos <- read_excel("pib_cantonal_final.xlsx")
+patentes_cantones <- read_excel("patentes 2020.xlsx")
+datos2 <- left_join(datos, patentes_cantones, by = "ID_canton")
+datos2 <- datos2[-36, ] 
+```
+
+Si bien al unir los dataframes por ID del cantón se asegura unir los datos de los mismos cantones, no está demás verificar si los nombres de un cantón son distintos entre los datos del PIB cantonal y los datos de las patentes.
+
+```{r}
+# Verificar si los valores de 'canton' y 'Estado' son diferentes en cada fila
+diferentes <- datos2$canton != datos2$Estado
+
+# Imprimir las filas donde los valores son diferentes
+filas_diferentes <- datos2[diferentes, ]
+print(filas_diferentes)
+```
+
+Se estandariza el nombre de el cantón de coronado. De todas maneras se remueve la variable del dataframe, ya que es la misma que cantón.
+
+```{r}
+# Modificar el valor de 'Estado' en la fila 'Coronado'
+datos2$Estado[datos2$Estado == "Coronado"] <- "Vázquez de Coronado"
+datos2 = datos2[,-8]
+datos2 <- datos2 %>% arrange(ID_canton)
+```
+
+
+### ANÁLISIS DE DATOS EXPLORATORIO (DEA)
+
+**Valores extremos**
+
+Los valores extremos solamente se identifican. No interesa eliminarlos puesto que solo hay una observación por cantón, además estos representan una estructura importante de los datos.
+
+```{r echo=FALSE}
+lev = hat(datos2[,3:8], intercept = F)
+plot(lev)
+lim = 2*mean(lev)
+abline(h=lim)
+
+filas_extremos = which(lev>lim)
+print(datos2[filas_extremos,])
+
+#datos2 = datos2[-filas_extremos,]
+```
+
+
+**Correlación entre las variables predictoras y estas con la variable respuesta**
+
+Correlación entre PIB cantonal y patentes municipales
+```{r echo=FALSE}
+cor(datos2$pib_cantonal, datos2$patentes)
+```
+
+Correlación entre PIB cantonal y Población
+```{r echo=FALSE}
+cor(datos2$pib_cantonal, datos2$total_poblacion)
+```
+
+Correlación entre población y patentes municipales
+```{r echo=FALSE}
+cor(datos2$patentes, datos2$total_poblacion) #Multicolinealidad
+```
+
+Las correlaciones de las variables predictoras con la variable respuesta son muy altas, por lo que se espera que aporten al modelo. Ahora, la correlación entre las variables predictoras también es alta, por lo que se espera multicolinealidad (no independencia lineal de los predictores). Se verifica rápidamente con el Factor de Inflación de Varianza (VIF)
+
+```{r}
+mod_prueba = lm(pib_cantonal~patentes*total_poblacion, data = datos2)
+vif(mod_prueba)
+#Sí hay multicolinealidad
+```
+
+Dado a que sí hay presencia de multicolinealidad se valora hacer PCA
+```{r}
+R=cor(datos2[,c(5,8)])
+cortest.bartlett(R,n=nrow(datos2)) #Prueba de esferecidad de Bartlett
+KMO(R) #Según este indicador parece que no tiene sentido hacer el PCA
+```
+
+```{r}
+#pca1=prcomp(datos2[,c(5,8)], scale = T)# Uso variables estandarizadas
+pca1=prcomp(datos2[,c(8,5)], scale = T)
+summary(pca1) #el 1er componente principal explica un 95,81% de la varianza
+biplot(pca1, cex=0.6)
+
+mod = lm(datos2$pib_cantonal ~ pca1$x[,1])
+summary(mod) #R^2 ajustado de 0.7481, es pobre comparado con los modelos de abajo. No se hacen las predicciones 
+```
+
+
+**Linealidad de los predictores con la var dependiente**
+
+```{r}
+scatterplot(datos2$patentes, datos2$pib_cantonal, ylab = "pibc",
+            col = 1,   # Change dots color
+            regLine = list(col = "green"),      
+            smooth = list(col.smooth = "red",   
+                          col.spread = "lightblue")) 
+
+scatterplot(datos2$total_poblacion, datos2$pib_cantonal, ylab = "pibc",
+            col = 1,   # Change dots color
+            regLine = list(col = "green"),      
+            smooth = list(col.smooth = "red",   
+                          col.spread = "lightblue")) 
+
+#No se puede asegurar linealidad entre los predictores y la respuesta. Se prueba con los gráficos de componente + residuos más adelante.
+```
+
+
+**Distribución de la variable dependiente y de los predictores**
+
+Se determina sus distribuciones con la finalidad de determinar si las variables necesitan algún tipo de transformación o bien, usar modelos lineales generalizados o modelos aditivos generalizados.
+
+Distribución de la variable respuesta
+```{r}
+dy <- density(datos2$pib_cantonal)
+densidad <- data.frame(x = dy$x, y = dy$y)
+
+ggplot(densidad, aes(x, y)) +
+  geom_line(color = "#FD8D3C", size = 1.5) +
+  geom_polygon(aes(x, y), fill = "#FD8D3C", alpha = 0.2) +
+  theme_minimal() +
+  theme(axis.line = element_line(size = 0.5),
+        axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12, face = "bold"),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  labs(title = "Distribución de PIB cantonal en 2020", 
+       x = "PIB cantonal", y = "Densidad") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  guides(fill = FALSE)
+
+#ggsave("dist_pib.png", width = 10, height = 6, dpi = 300)
+```
+
+
+Distribución patentes
+```{r}
+dy <- density(datos2$patentes)
+densidad <- data.frame(x = dy$x, y = dy$y)
+
+ggplot(densidad, aes(x, y)) +
+  geom_line(color = "#FD8D3C", size = 1.5) +
+  geom_polygon(aes(x, y), fill = "#FD8D3C", alpha = 0.2) +
+  theme_minimal() +
+  theme(axis.line = element_line(size = 0.5),
+        axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12, face = "bold"),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  labs(title = "Distribución de patentes en 2020", 
+       x = "Patentes", y = "Densidad") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  guides(fill = FALSE)
+```
+
+
+Distribución población
+```{r}
+dy <- density(datos2$total_poblacion)
+densidad <- data.frame(x = dy$x, y = dy$y)
+
+ggplot(densidad, aes(x, y)) +
+  geom_line(color = "#FD8D3C", size = 1.5) +
+  geom_polygon(aes(x, y), fill = "#FD8D3C", alpha = 0.2) +
+  theme_minimal() +
+  theme(axis.line = element_line(size = 0.5),
+        axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12, face = "bold"),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  labs(title = "Distribución de población en 2020", 
+       x = "Población", y = "Densidad") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  guides(fill = FALSE)
+```
+
+Se observa que tanto los predictores como la variable dependiente parecen tener una distribución que se asemeja a la lognormal. Se utilizan distintos criterios para determinar sus distribuciones a partir de la siguiente función:
+
+```{r}
+pib_cantonal = datos2$pib_cantonal
+poblacion = datos2$total_poblacion
+patentes = datos2$patentes
+#fitur::fit_dist_addin() #Resultados no se muestran en el documento, verlos por aparte
+```
+
+Según los distintos indicadores, las tres variables se ajustan a una distribución log-normal.
+En este sentido, se plantean distintos tipos de modelos de regresión a los cuales se les aplican las correcciones necesarias en caso del incumplimiento de supuestos. Además, para cada tipo de modelo se considera usar una sola variable (pantentes) o usar ambas variables (patentes y población). Los modelos de regresión que consideran son: 
+
+1) lineal sin transformaciones en las variables
+2) lineal con transformaciones en las variables
+3) lineal generalizado con función de enlace lognormal
+4) aditivo generalizado
+
+
+
+### Modelos de regresión propuestos
+
+#### 1) Modelo de regresión lineal sin transformaciones
+
+```{r}
+modelo1 = lm(pib_cantonal~patentes, data = datos2)
+modelo1b = lm(pib_cantonal~patentes+total_poblacion, data = datos2)
+anova(modelo1, modelo1b) #La variable población es significativa
+
+modelo2 = lm(pib_cantonal~patentes*total_poblacion, data = datos2)
+anova(modelo1b, modelo2) #La interacción es significativa
+
+#Ajuste de los modelos
+summary(modelo1) #R^2 ajustado: 0.8374
+summary(modelo2) #R^2 ajustado: 0.9522
+```
+
+A partir de los resultados de la prueba de hipótesis se escogería el modelo 2, ya que este modelo tiene un R2 ajustado de 0.9522. Sin embargo, este modelo tiene dos problemas: 1) Multicolinealidad y 2) la distribución de la variable respuesta NO es normal.
+
+
+#### 2) Modelo de regresión lineal con transformación log
+
+```{r}
+modelo_log <- lm(log(pib_cantonal) ~ log(patentes), data = datos2)
+modelo_log_b <- lm(log(pib_cantonal) ~ log(patentes) + log(total_poblacion), data = datos2)
+anova(modelo_log, modelo_log_b) #La variable población es significativa
+
+modelo_log2 <- lm(log(pib_cantonal) ~  log(patentes) * log(total_poblacion), data = datos2)
+anova(modelo_log_b, modelo_log2) #La interacción es significativa
+
+#Ajuste de los modelos
+summary(modelo_log) #R^2 ajustado: 0.8271
+summary(modelo_log2) #R^2 ajustado: 0.8609
+```
+
+
+
+#### 3) Modelo lineal generalizado
+
+**SOLO CON PATENTES**
+
+```{r}
+modelo_lognrm1=glm(pib_cantonal~patentes, family = gaussian(link = "log"), data = datos2)
+summary(modelo_lognrm1)
+```
+
+Pseudo R2 Log normal
+```{r echo=FALSE}
+devianza_nula1 = summary(modelo_lognrm1)$null.deviance #varianza total
+devianza_residual1 = summary(modelo_lognrm1)$deviance #varianza no explicada
+(devianza_nula1-devianza_residual1)/devianza_nula1
+```
+
+##### Evaluación de los supuestos para este GLM
+
+```{r echo=FALSE}
+par(mfrow = c(2,2)) 
+plot(modelo_lognrm1)
+#Hay heterocedasticidad y los errores no se distribuyen normalmente.
+
+residuos_est1=rstandard(modelo_lognrm1)
+par(mfrow = c(1,1))
+qqPlot(residuos_est1, col.lines = "lightskyblue", xlab = "Cuantiles teoricos", ylab = "Residuos estandarizados")  
+#Con los residuos estandarizados se llega a la misma conclusión sobre los errores.
+
+crPlots(modelo_lognrm1)
+#No se puede asegurar linealidad entre las variables predictoras y la variable respuesta.
+```
+
+
+
+**Con ambas variables:**
+
+```{r}
+modelo_lognrm2=glm(pib_cantonal~patentes*total_poblacion, family = gaussian(link = "log"), data = datos2)
+drop1(modelo_lognrm2,test="LRT")
+summary(modelo_lognrm2)
+```
+
+Pseudo R2 Log normal
+```{r echo=FALSE}
+devianza_nula2 = summary(modelo_lognrm2)$null.deviance #varianza total
+devianza_residual2 = summary(modelo_lognrm2)$deviance #varianza no explicada
+(devianza_nula2-devianza_residual2)/devianza_nula2
+```
+
+##### Evaluación de los supuestos para este GLM
+
+```{r echo=FALSE}
+par(mfrow = c(2,2) ) 
+plot(modelo_lognrm2)
+#Hay heterocedasticidad y los errores no se distribuyen normalmente.
+
+residuos_est2=rstandard(modelo_lognrm2)
+par(mfrow = c(1,1))
+qqPlot(residuos_est2, col.lines = "lightskyblue", xlab = "Cuantiles teoricos", ylab = "Residuos estandarizados")  
+#Con los residuos estandarizados se llega a la misma conclusión sobre los errores.
+```
+
+
+```{r echo=FALSE}
+modelo_lognrm2_especial=glm(pib_cantonal~patentes+total_poblacion, family = gaussian(link = "log"), 
+                  data = datos2)
+
+crPlots(modelo_lognrm2_especial) #en el grafco no sale con poblacion, revisar***
+
+#Parece que no hay linealidad entre las variables predictoras y la variable respuesta, por lo que es más apropiado probar con un modelo aditivo generalizado.
+```
+
+
+
+
+#### 4) Modelo aditivo generalizado
+
+
+**Con dos variables directamente**
+
+```{r}
+gam_lognrm1=gam(pib_cantonal~s(patentes)+s(total_poblacion)+s(patentes,total_poblacion), 
+                family = gaussian(link = "log"),
+                data = datos2)
+
+gam_lognrm2=gam(pib_cantonal~s(patentes)+s(total_poblacion)+ti(patentes,total_poblacion), 
+                family = gaussian(link = "log"),
+                data = datos2)
+
+gam_lognrm3=gam(pib_cantonal~s(patentes)+s(total_poblacion)+s(patentes,total_poblacion), 
+                family = gaussian(link = "log"),
+                method = "REML",
+                data = datos2)
+
+
+gam_lognrm4=gam(pib_cantonal~s(patentes)+s(total_poblacion)+ti(patentes,total_poblacion), 
+                family = gaussian(link = "log"),
+                method = "REML",
+                data = datos2)
+
+
+compare_performance(gam_lognrm1, gam_lognrm2, gam_lognrm3, gam_lognrm4)
+appraise(gam_lognrm1, method = "simulate")
+appraise(gam_lognrm2, method = "simulate")
+appraise(gam_lognrm3, method = "simulate")
+appraise(gam_lognrm4, method = "simulate")
+
+
+summary(gam_lognrm2)
+draw(gam_lognrm2)
+
+
+par(mfrow = c(2,2))
+plot(gam_lognrm2)
+res_glm2=gam_lognrm2$residuals
+par(mfrow = c(1,1))
+qqPlot(res_glm2, col.lines = "lightskyblue", xlab = "Cuantiles teoricos", ylab = "Residuos")  
+```
+
+
+
+**Predicciones:**
+```{r}
+gam2_prediccion_2015 <- predict(gam_lognrm2, newdata = datos_2015[,c(3,4), drop = FALSE], type = "response")
+gam2_prediccion_2016 <- predict(gam_lognrm2, newdata = datos_2016[,c(3,4), drop = FALSE], type = "response")
+gam2_prediccion_2017 <- predict(gam_lognrm2, newdata = datos_2017[,c(3,4), drop = FALSE], type = "response")
+gam2_prediccion_2018 <- predict(gam_lognrm2, newdata = datos_2018[,c(3,4), drop = FALSE], type = "response")
+gam2_prediccion_2019 <- predict(gam_lognrm2, newdata = datos_2019[,c(3,4), drop = FALSE], type = "response")
+gam2_prediccion_2021 <- predict(gam_lognrm2, newdata = datos_2021[,c(3,4), drop = FALSE], type = "response")
+```
+
+```{r}
+PIB_2020 = datos2$pib_cantonal
+predicciones_gam2<- as.data.frame(cbind(datos2$ID_canton,
+                                       datos2$canton,
+                                       gam2_prediccion_2015, 
+                                       gam2_prediccion_2016, 
+                                       gam2_prediccion_2017, 
+                                       gam2_prediccion_2018,
+                                       gam2_prediccion_2019, 
+                                       PIB_2020, 
+                                       gam2_prediccion_2021))
+
+colnames(predicciones_gam2) = c("ID_canton", "canton", "Pred 2015", "Pred 2016", "Pred 2017", "Pred 2018", "Pred 2019", "PIB 2020", "Pred 2021")
+
+predicciones_gam2 <- predicciones_gam2 %>% mutate_at(vars(-c(1,2)), as.numeric)
+print(predicciones_gam2)
+```
+
+```{r}
+#Número de estimaciones cuyo valor estima se aleja más de un 15% del valor real del PIB 2020
+
+prediccion2020_gam2 <- predict(gam_lognrm2, newdata = datos2[,c(8,5), drop = FALSE], type = "response")
+porcentaje_diferencia2 <- abs(datos2$pib_cantonal - prediccion2020_gam2) / datos2$pib_cantonal * 100
+predicciones_alejadas2 <- porcentaje_diferencia2 > 30
+sum(predicciones_alejadas2 == "TRUE")
+
+cantones_alejados2 <- datos2$canton[predicciones_alejadas2]
+cantidad_cantones_alejados2 <- length(cantones_alejados2)
+print(cantones_alejados2)
+```
+
+
+
+___________________________________________________________________________________________________________
+
+
+**Se guardan las predicciones**
+```{r}
+#predicciones_finales = predicciones_gam2
+#write.xlsx(predicciones_finales, file = "predicciones_finales.xlsx", row.names = FALSE)
+#save(predicciones_finales, file = "predicciones_finales.RData")
+#load("predicciones_finales.Rdata")
+```
+
+
+
+___________________________________________________________________________________________________
+
+
+
